@@ -2,17 +2,19 @@ import os
 import sys
 import json
 import logging
+import asyncio
 from pathlib import Path
+from datetime import datetime
 
-import google.generativeai as genai
-from google.api_core.exceptions import PermissionDenied, InvalidArgument
-
-# Load .env when running locally (Render injects env vars directly)
+# Load .env when running locally
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
 except ImportError:
     pass
+
+import google.generativeai as genai
+from groq import Groq
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,7 +27,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -33,49 +35,108 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-# Optional owner fallback key — users can supply their own instead
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+DEFAULT_GROQ_KEY   = os.getenv("GROQ_API_KEY", "")
 
 if not TELEGRAM_TOKEN:
-    logger.critical("TELEGRAM_TOKEN is not set! Add it in Render Dashboard -> Environment.")
+    logger.critical("TELEGRAM_TOKEN is not set!")
     sys.exit(1)
 
-# ─── Persistent user-key store (JSON file) ───────────────────────────────────
-# Render mounts a persistent disk at /data; fall back to local dir for dev
-_DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).parent
-KEYS_FILE = _DATA_DIR / "user_keys.json"
+# ─── Persistent storage ───────────────────────────────────────────────────────
+_DATA_DIR    = Path("/data") if Path("/data").exists() else Path(__file__).parent
+KEYS_FILE    = _DATA_DIR / "user_keys.json"
+HISTORY_FILE = _DATA_DIR / "story_history.json"
 
-def _load_keys() -> dict:
-    if KEYS_FILE.exists():
+def _load_json(path: Path) -> dict:
+    if path.exists():
         try:
-            return json.loads(KEYS_FILE.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
 
-def _save_keys(data: dict) -> None:
-    KEYS_FILE.write_text(json.dumps(data, indent=2))
+def _save_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-USER_KEYS: dict = _load_keys()   # { "user_id_str": "AIzaSy..." }
+USER_KEYS:    dict = _load_json(KEYS_FILE)
+STORY_HISTORY: dict = _load_json(HISTORY_FILE)
 
-def get_user_key(user_id: int) -> str:
-    return USER_KEYS.get(str(user_id), DEFAULT_GEMINI_KEY)
+# Key helpers
+def get_user_gemini_key(uid: int) -> str:
+    return USER_KEYS.get(str(uid), {}).get("gemini", DEFAULT_GEMINI_KEY)
 
-def set_user_key(user_id: int, key: str) -> None:
-    USER_KEYS[str(user_id)] = key
-    _save_keys(USER_KEYS)
+def get_user_groq_key(uid: int) -> str:
+    return USER_KEYS.get(str(uid), {}).get("groq", DEFAULT_GROQ_KEY)
 
-def delete_user_key(user_id: int) -> bool:
-    uid = str(user_id)
-    if uid in USER_KEYS:
-        del USER_KEYS[uid]
-        _save_keys(USER_KEYS)
+def get_user_provider(uid: int) -> str:
+    return USER_KEYS.get(str(uid), {}).get("provider", "groq")
+
+def get_user_model(uid: int) -> str:
+    defaults = {"groq": "llama-3.3-70b-versatile", "gemini": "gemini-1.5-flash"}
+    provider = get_user_provider(uid)
+    return USER_KEYS.get(str(uid), {}).get("model", defaults.get(provider, "llama-3.3-70b-versatile"))
+
+def set_user_data(uid: int, **kwargs) -> None:
+    key = str(uid)
+    if key not in USER_KEYS:
+        USER_KEYS[key] = {}
+    USER_KEYS[key].update(kwargs)
+    _save_json(KEYS_FILE, USER_KEYS)
+
+def delete_user_key(uid: int, provider: str) -> bool:
+    key = str(uid)
+    if key in USER_KEYS and provider in USER_KEYS[key]:
+        del USER_KEYS[key][provider]
+        _save_json(KEYS_FILE, USER_KEYS)
         return True
     return False
 
+# History helpers
+MAX_HISTORY = 20
+
+def add_to_history(uid: int, genre: str, topic: str, story: str) -> None:
+    key = str(uid)
+    if key not in STORY_HISTORY:
+        STORY_HISTORY[key] = []
+    STORY_HISTORY[key].insert(0, {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "genre": genre,
+        "topic": topic,
+        "story": story[:500],  # store first 500 chars
+    })
+    STORY_HISTORY[key] = STORY_HISTORY[key][:MAX_HISTORY]
+    _save_json(HISTORY_FILE, STORY_HISTORY)
+
+def get_history(uid: int) -> list:
+    return STORY_HISTORY.get(str(uid), [])
+
+# ─── AI Models Config ─────────────────────────────────────────────────────────
+GROQ_MODELS = {
+    "llama-3.3-70b-versatile": "⚡ Llama 3.3 70B (Best)",
+    "llama-3.1-8b-instant":    "🚀 Llama 3.1 8B (Fastest)",
+    "mixtral-8x7b-32768":      "🎯 Mixtral 8x7B",
+    "gemma2-9b-it":            "💎 Gemma 2 9B",
+}
+
+GEMINI_MODELS = {
+    "gemini-1.5-flash":   "⚡ Gemini 1.5 Flash (Fast)",
+    "gemini-1.5-pro":     "🧠 Gemini 1.5 Pro (Best)",
+    "gemini-2.0-flash":   "🚀 Gemini 2.0 Flash",
+}
+
 # ─── Conversation States ──────────────────────────────────────────────────────
-CHOOSING_GENRE, TYPING_TOPIC, READING_STORY, WAITING_FOR_KEY = range(4)
+(
+    CHOOSING_GENRE,
+    TYPING_TOPIC,
+    READING_STORY,
+    WAITING_FOR_KEY,
+    CHOOSING_PROVIDER,
+    CHOOSING_MODEL,
+    VIEWING_HISTORY,
+) = range(7)
+
+WAITING_KEY_TYPE = "waiting_key_type"  # stored in context.user_data
 
 # ─── Story Genres ─────────────────────────────────────────────────────────────
 GENRES = {
@@ -87,6 +148,8 @@ GENRES = {
     "legend":    ("🌟 រឿងព្រេង",     "Khmer legend / mythology"),
     "modern":    ("🏙️ រឿងទំនើប",    "Modern Khmer daily life story"),
     "children":  ("🌈 រឿងកុមារ",    "Khmer children bedtime story"),
+    "comedy":    ("😄 រឿងកំប្លែង",  "Khmer comedy / funny story"),
+    "mystery":   ("🔍 រឿងអាថ៌កំបាំង", "Khmer mystery / detective story"),
 }
 
 SYSTEM_PROMPT = """អ្នកជាអ្នកនិទានរឿងខ្មែរដ៏ពូកែ និងជំនាញ។
@@ -97,7 +160,7 @@ SYSTEM_PROMPT = """អ្នកជាអ្នកនិទានរឿងខ្�
 - ចាប់ផ្តើមរឿងដោយបែបទាក់ទាញ
 - ប្រើភាសាខ្មែរស្អាត ងាយយល់
 - បន្ថែមស្មារតីខ្មែរ ទំនៀមទម្លាប់ ឬជំនឿ
-- រឿងគួរមានអំណានពី ១០០-២០០ ពាក្យ
+- រឿងគួរមានអំណានពី ១៥០-២៥០ ពាក្យ
 - បញ្ចប់ដោយសាររឿង ឬអត្ថន័យស្រស់ស្អាត
 - គ្រប់ "ថ្នាក់" ទាំងអស់ត្រូវសរសេរជាទម្រង់ paragraph
 """
@@ -119,214 +182,401 @@ def action_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔄 រឿងថ្មីទៀត",  callback_data="action:new"),
             InlineKeyboardButton("📖 ប្រភេទផ្សេង", callback_data="action:genres"),
         ],
-        [InlineKeyboardButton("🏠 ទំព័រដើម", callback_data="action:home")],
+        [
+            InlineKeyboardButton("📚 ប្រវត្តិ",    callback_data="action:history"),
+            InlineKeyboardButton("🏠 ទំព័រដើម",    callback_data="action:home"),
+        ],
     ])
 
-def key_manage_keyboard() -> InlineKeyboardMarkup:
+def provider_keyboard(uid: int) -> InlineKeyboardMarkup:
+    current = get_user_provider(uid)
+    groq_mark   = "✅ " if current == "groq"   else ""
+    gemini_mark = "✅ " if current == "gemini" else ""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔑 ប្តូរ Key ថ្មី", callback_data="key:set"),
-            InlineKeyboardButton("🗑️ លុប Key",        callback_data="key:delete"),
+            InlineKeyboardButton(f"{groq_mark}⚡ Groq (បញ្ចូល)", callback_data="prov:groq"),
+            InlineKeyboardButton(f"{gemini_mark}🤖 Gemini",       callback_data="prov:gemini"),
         ],
-        [InlineKeyboardButton("◀️ ត្រឡប់", callback_data="key:back")],
+        [InlineKeyboardButton("◀️ ត្រឡប់", callback_data="prov:back")],
     ])
 
-# ─── Gemini ───────────────────────────────────────────────────────────────────
-import asyncio
-import google.generativeai as _genai_mod
+def groq_model_keyboard(uid: int) -> InlineKeyboardMarkup:
+    current = get_user_model(uid)
+    rows = []
+    for m, label in GROQ_MODELS.items():
+        mark = "✅ " if current == m else ""
+        rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"model:{m}")])
+    rows.append([InlineKeyboardButton("◀️ ត្រឡប់", callback_data="model:back")])
+    return InlineKeyboardMarkup(rows)
 
-def _call_gemini(api_key: str, prompt: str) -> str:
-    """Run in a thread — avoids blocking the async event loop."""
+def gemini_model_keyboard(uid: int) -> InlineKeyboardMarkup:
+    current = get_user_model(uid)
+    rows = []
+    for m, label in GEMINI_MODELS.items():
+        mark = "✅ " if current == m else ""
+        rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"model:{m}")])
+    rows.append([InlineKeyboardButton("◀️ ត្រឡប់", callback_data="model:back")])
+    return InlineKeyboardMarkup(rows)
+
+def settings_keyboard(uid: int) -> InlineKeyboardMarkup:
+    provider = get_user_provider(uid)
+    model    = get_user_model(uid)
+    groq_key   = get_user_groq_key(uid)
+    gemini_key = get_user_gemini_key(uid)
+    groq_status   = "✅" if groq_key   else "❌"
+    gemini_status = "✅" if gemini_key else "❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔀 AI Provider: {provider.title()}", callback_data="settings:provider")],
+        [InlineKeyboardButton(f"🧠 Model: {model[:25]}",              callback_data="settings:model")],
+        [
+            InlineKeyboardButton(f"{groq_status} Groq Key",   callback_data="settings:set_groq"),
+            InlineKeyboardButton(f"{gemini_status} Gemini Key", callback_data="settings:set_gemini"),
+        ],
+        [
+            InlineKeyboardButton("🗑️ លុប Groq Key",   callback_data="settings:del_groq"),
+            InlineKeyboardButton("🗑️ លុប Gemini Key", callback_data="settings:del_gemini"),
+        ],
+        [InlineKeyboardButton("◀️ ទំព័រដើម", callback_data="settings:home")],
+    ])
+
+# ─── AI Providers ─────────────────────────────────────────────────────────────
+def _call_groq(api_key: str, model: str, prompt: str) -> str:
+    client = Groq(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        max_tokens=1024,
+        temperature=0.85,
+    )
+    return resp.choices[0].message.content
+
+def _call_gemini(api_key: str, model: str, prompt: str) -> str:
     import google.generativeai as g
     g.configure(api_key=api_key)
-    m = g.GenerativeModel("gemini-1.5-flash")
-    return m.generate_content(prompt).text
+    m = g.GenerativeModel(model)
+    return m.generate_content(SYSTEM_PROMPT + "\n\n" + prompt).text
 
-async def generate_story(api_key: str, genre_desc: str, topic: str) -> str:
-    if not api_key:
-        return "⚠️ *គ្មាន API Key!*\nសូមប្រើ /setkey ដើម្បីដាក់ Gemini API Key ជាមុន។"
+async def generate_story(uid: int, genre_desc: str, topic: str) -> tuple[str, str]:
+    """Returns (story_text, provider_used)."""
+    provider  = get_user_provider(uid)
+    model     = get_user_model(uid)
+    groq_key  = get_user_groq_key(uid)
+    gemini_key = get_user_gemini_key(uid)
+
     prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
         f"ប្រភេទរឿង: {genre_desc}\n"
         f"ប្រធានបទ: {topic}\n\n"
         f"សូមសរសេររឿងខ្មែរមួយពីប្រធានបទខាងលើ:"
     )
-    try:
-        loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, _call_gemini, api_key, prompt)
-        return text
-    except Exception as e:
-        err = str(e).lower()
-        logger.error(f"Gemini error: {e}")
-        if "api_key" in err or "permission" in err or "invalid" in err or "credential" in err:
-            return "🔑 *Gemini API Key មិនត្រឹមត្រូវ!*\nសូមប្រើ /setkey ដើម្បីដាក់ key ថ្មី។"
-        if "quota" in err or "rate" in err or "429" in err:
-            return "⏳ *Gemini free tier ផុត quota!*\nសូមរង់ចាំ ១ នាទី ហើយព្យាយាមម្តងទៀត។"
-        return "❌ មានបញ្ហាក្នុងការបង្កើតរឿង។ សូមព្យាយាមម្តងទៀត។"
+
+    loop = asyncio.get_event_loop()
+
+    # Try primary provider first
+    primary_fn   = _call_groq   if provider == "groq"   else _call_gemini
+    primary_key  = groq_key     if provider == "groq"   else gemini_key
+    fallback_fn  = _call_gemini if provider == "groq"   else _call_groq
+    fallback_key = gemini_key   if provider == "groq"   else groq_key
+
+    # Default models for fallback
+    fallback_model = "gemini-1.5-flash" if provider == "groq" else "llama-3.3-70b-versatile"
+
+    if primary_key:
+        try:
+            text = await loop.run_in_executor(None, primary_fn, primary_key, model, prompt)
+            return text, provider
+        except Exception as e:
+            logger.warning(f"Primary ({provider}) failed: {e}. Trying fallback.")
+
+    # Try fallback provider
+    if fallback_key:
+        try:
+            text = await loop.run_in_executor(None, fallback_fn, fallback_key, fallback_model, prompt)
+            fallback_name = "gemini" if provider == "groq" else "groq"
+            return text, fallback_name
+        except Exception as e:
+            logger.error(f"Fallback also failed: {e}")
+
+    return "⚠️ *មិនមាន API Key!*\nសូមប្រើ /settings ដើម្បីដាក់ Groq ឬ Gemini Key។", "none"
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    if not get_user_key(user.id):
+    uid  = user.id
+    has_key = get_user_groq_key(uid) or get_user_gemini_key(uid)
+
+    if not has_key:
         await update.message.reply_text(
             f"🙏 សួស្តី *{user.first_name}*!\n\n"
-            "🎭 *ស្វាគមន៍មកកាន់ Bot និទានរឿងខ្មែរ AI!*\n\n"
-            "⚠️ Bot នេះប្រើ *Gemini API Key* របស់អ្នកផ្ទាល់។\n\n"
-            "👉 *ជំហាន:*\n"
-            "1\\. ទទួល key ឥតគិតថ្លៃ: [aistudio\\.google\\.com](https://aistudio.google.com/app/apikey)\n"
-            "2\\. ប្រើ /setkey → វាយ key\n"
-            "3\\. ចាប់ផ្តើមនិទានរឿង 🎉",
-            parse_mode="MarkdownV2",
+            "🎭 *ស្វាគមន៍មកកាន់ Bot និទានរឿងខ្មែរ AI v2!*\n\n"
+            "✨ *ថ្មី:* គាំទ្រ Groq AI (លឿនជាង 10x) + Gemini!\n\n"
+            "⚡ *Groq API Key (FREE & FAST):*\n"
+            "👉 [console.groq.com/keys](https://console.groq.com/keys)\n\n"
+            "🤖 *Gemini API Key (FREE):*\n"
+            "👉 [aistudio.google.com](https://aistudio.google.com/app/apikey)\n\n"
+            "ប្រើ /settings ដើម្បីដាក់ key 🔑",
+            parse_mode="Markdown",
             disable_web_page_preview=True,
         )
         return ConversationHandler.END
 
     await update.message.reply_text(
         f"🙏 សួស្តី *{user.first_name}*!\n\n"
-        "🎭 *ស្វាគមន៍មកកាន់ Bot និទានរឿងខ្មែរ AI!*\n\n"
+        "🎭 *Bot និទានរឿងខ្មែរ AI v2*\n\n"
         "សូមជ្រើសរើសប្រភេទរឿង ⬇️",
         parse_mode="Markdown",
         reply_markup=genre_keyboard(),
     )
     return CHOOSING_GENRE
 
-# ─── /setkey flow ─────────────────────────────────────────────────────────────
-async def setkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─── /settings ────────────────────────────────────────────────────────────────
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    provider = get_user_provider(uid)
+    model    = get_user_model(uid)
     await update.message.reply_text(
-        "🔑 *ដាក់ Gemini API Key*\n\n"
-        "សូមវាយ API Key របស់អ្នក:\n"
-        "_\\(Key ចាប់ផ្តើមដោយ `AIzaSy...`\\)_\n\n"
-        "ទទួល key ឥតគិតថ្លៃ: [aistudio\\.google\\.com](https://aistudio.google.com/app/apikey)\n\n"
-        "⚠️ Bot នឹងលុប message ដែលមាន key ភ្លាម ដើម្បីសុវត្ថិភាព\\.\n\n"
-        "/cancel ដើម្បីបោះបង់\\.",
-        parse_mode="MarkdownV2",
-        disable_web_page_preview=True,
+        f"⚙️ *ការកំណត់*\n\n"
+        f"🔀 Provider: *{provider.title()}*\n"
+        f"🧠 Model: `{model}`\n\n"
+        "ជ្រើសរើសសកម្មភាព:",
+        parse_mode="Markdown",
+        reply_markup=settings_keyboard(uid),
     )
-    return WAITING_FOR_KEY
+    return ConversationHandler.END
 
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query  = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    uid    = query.from_user.id
+
+    if action == "provider":
+        await query.edit_message_text(
+            "🔀 *ជ្រើសរើស AI Provider:*\n\n"
+            "⚡ *Groq* — លឿនណាស់ (< 1 វិនាទី), ឥតគិតថ្លៃ\n"
+            "🤖 *Gemini* — Google AI, ឥតគិតថ្លៃ\n\n"
+            "ប្រសិនបើ provider ដំបូងរអាក, bot នឹងប្តូរ provider ទីពីរដោយស្វ័យប្រវត្ត!",
+            parse_mode="Markdown",
+            reply_markup=provider_keyboard(uid),
+        )
+        return ConversationHandler.END
+
+    elif action == "model":
+        provider = get_user_provider(uid)
+        kb = groq_model_keyboard(uid) if provider == "groq" else gemini_model_keyboard(uid)
+        await query.edit_message_text(
+            f"🧠 *ជ្រើសរើស Model ({provider.title()}):*",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return CHOOSING_MODEL
+
+    elif action == "set_groq":
+        context.user_data[WAITING_KEY_TYPE] = "groq"
+        await query.edit_message_text(
+            "🔑 *ដាក់ Groq API Key*\n\n"
+            "ទទួល key ឥតគិតថ្លៃ: [console.groq.com/keys](https://console.groq.com/keys)\n\n"
+            "Key ចាប់ផ្តើមដោយ `gsk_...`\n\n"
+            "⚠️ Bot នឹងលុប message ភ្លាម ដើម្បីសុវត្ថិភាព\n\n"
+            "/cancel ដើម្បីបោះបង់",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return WAITING_FOR_KEY
+
+    elif action == "set_gemini":
+        context.user_data[WAITING_KEY_TYPE] = "gemini"
+        await query.edit_message_text(
+            "🔑 *ដាក់ Gemini API Key*\n\n"
+            "ទទួល key ឥតគិតថ្លៃ: [aistudio.google.com](https://aistudio.google.com/app/apikey)\n\n"
+            "Key ចាប់ផ្តើមដោយ `AIzaSy...`\n\n"
+            "⚠️ Bot នឹងលុប message ភ្លាម ដើម្បីសុវត្ថិភាព\n\n"
+            "/cancel ដើម្បីបោះបង់",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return WAITING_FOR_KEY
+
+    elif action == "del_groq":
+        if delete_user_key(uid, "groq"):
+            await query.edit_message_text("🗑️ *Groq Key ត្រូវបានលុប!*", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("⚠️ គ្មាន Groq Key ដើម្បីលុប។")
+        return ConversationHandler.END
+
+    elif action == "del_gemini":
+        if delete_user_key(uid, "gemini"):
+            await query.edit_message_text("🗑️ *Gemini Key ត្រូវបានលុប!*", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("⚠️ គ្មាន Gemini Key ដើម្បីលុប។")
+        return ConversationHandler.END
+
+    elif action == "home":
+        await query.edit_message_text(
+            "🏠 *ទំព័រដើម*\n\n"
+            "• /story — បង្កើតរឿង\n"
+            "• /settings — ការកំណត់ / Keys\n"
+            "• /history — ប្រវត្តិរឿង\n"
+            "• /help — ជំនួយ",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+# ─── Provider selection callback ─────────────────────────────────────────────
+async def provider_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query  = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    uid    = query.from_user.id
+
+    if choice == "back":
+        await query.edit_message_text("◀️ ប្រើ /settings ដើម្បីត្រឡប់ការកំណត់។")
+        return ConversationHandler.END
+
+    set_user_data(uid, provider=choice)
+    # Reset to default model for the new provider
+    default_model = "llama-3.3-70b-versatile" if choice == "groq" else "gemini-1.5-flash"
+    set_user_data(uid, model=default_model)
+
+    await query.edit_message_text(
+        f"✅ *ប្ដូរទៅ {choice.title()} រួចហើយ!*\n"
+        f"🧠 Model: `{default_model}`\n\n"
+        "ប្រើ /story ដើម្បីចាប់ផ្តើម ឬ /settings ដើម្បីប្តូរ model។",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+# ─── Model selection callback ─────────────────────────────────────────────────
+async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query  = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    uid    = query.from_user.id
+
+    if choice == "back":
+        await query.edit_message_text("◀️ ប្រើ /settings ដើម្បីត្រឡប់ការកំណត់។")
+        return ConversationHandler.END
+
+    set_user_data(uid, model=choice)
+    all_models = {**GROQ_MODELS, **GEMINI_MODELS}
+    label = all_models.get(choice, choice)
+
+    await query.edit_message_text(
+        f"✅ *ប្ដូរ Model: {label}*\n\nប្រើ /story ដើម្បីចាប់ផ្តើម!",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+# ─── Receive API key ──────────────────────────────────────────────────────────
 async def receive_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    key = update.message.text.strip()
-    user_id = update.effective_user.id
+    key      = update.message.text.strip()
+    uid      = update.effective_user.id
+    key_type = context.user_data.get(WAITING_KEY_TYPE, "groq")
 
-    # Delete the message immediately for security
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    if not key.startswith("AIza") or len(key) < 30:
+    # Validate format
+    if key_type == "groq" and (not key.startswith("gsk_") or len(key) < 20):
         await update.message.reply_text(
-            "❌ *Key មិនត្រឹមត្រូវ!*\n\n"
-            "Key ត្រូវចាប់ផ្តើមដោយ `AIzaSy...`\n"
-            "សូមព្យាយាមម្តងទៀត ឬ /cancel ដើម្បីបោះបង់។",
+            "❌ *Groq Key មិនត្រឹមត្រូវ!*\n\nKey ត្រូវចាប់ផ្តើមដោយ `gsk_`\n"
+            "ព្យាយាមម្តងទៀត ឬ /cancel",
+            parse_mode="Markdown",
+        )
+        return WAITING_FOR_KEY
+
+    if key_type == "gemini" and (not key.startswith("AIza") or len(key) < 30):
+        await update.message.reply_text(
+            "❌ *Gemini Key មិនត្រឹមត្រូវ!*\n\nKey ត្រូវចាប់ផ្តើមដោយ `AIzaSy`\n"
+            "ព្យាយាមម្តងទៀត ឬ /cancel",
             parse_mode="Markdown",
         )
         return WAITING_FOR_KEY
 
     validating_msg = await update.message.reply_text(
-        "⏳ *កំពុងត្រួតពិនិត្យ Key...*", parse_mode="Markdown"
+        f"⏳ *កំពុងត្រួតពិនិត្យ {key_type.title()} Key...*", parse_mode="Markdown"
     )
+
+    # Validate against live API
+    loop = asyncio.get_event_loop()
     try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _call_gemini, key, "hi")
-        set_user_key(user_id, key)
+        if key_type == "groq":
+            await loop.run_in_executor(
+                None, _call_groq, key, "llama-3.1-8b-instant", "Say 'ok' in one word."
+            )
+        else:
+            await loop.run_in_executor(
+                None, _call_gemini, key, "gemini-1.5-flash", "Say 'ok' in one word."
+            )
+
+        set_user_data(uid, **{key_type: key})
+        # Auto-set provider to the one they just added
+        set_user_data(uid, provider=key_type)
+
         await validating_msg.edit_text(
-            "✅ *API Key ត្រឹមត្រូវ! រក្សាទុករួចហើយ។*\n\n"
-            "ប្រើ /story ដើម្បីចាប់ផ្តើមនិទានរឿង 🎭",
+            f"✅ *{key_type.title()} Key ត្រឹមត្រូវ! រក្សាទុករួចហើយ।*\n\n"
+            f"🔀 Provider ប្ដូរទៅ *{key_type.title()}* ដោយស្វ័យប្រវត្ត\n\n"
+            "ប្រើ /story ដើម្បីចាប់ផ្តើម 🎭",
             parse_mode="Markdown",
         )
         return ConversationHandler.END
 
     except Exception as e:
         err = str(e).lower()
-        logger.warning(f"Key validation error: {e}")
-        if "api_key" in err or "permission" in err or "invalid" in err or "credential" in err:
+        logger.warning(f"Key validation error ({key_type}): {e}")
+        if any(w in err for w in ["api_key", "permission", "invalid", "credential", "auth", "unauthorized"]):
             await validating_msg.edit_text(
-                "❌ *Key នេះខុស ឬគ្មានសិទ្ធ!*\n\n"
-                "សូមពិនិត្យ key ម្តងទៀត ឬបង្កើតថ្មី:\n"
-                "[aistudio.google.com](https://aistudio.google.com/app/apikey)\n\n"
-                "ព្យាយាមម្តងទៀត ឬ /cancel ដើម្បីបោះបង់។",
+                f"❌ *{key_type.title()} Key ខុស!*\n\nសូមពិនិត្យ key ម្តងទៀត ឬ /cancel",
                 parse_mode="Markdown",
-                disable_web_page_preview=True,
             )
             return WAITING_FOR_KEY
-        # Network/unknown error — save anyway and let user test
-        set_user_key(user_id, key)
+
+        # Network/unknown — save anyway
+        set_user_data(uid, **{key_type: key})
+        set_user_data(uid, provider=key_type)
         await validating_msg.edit_text(
-            "⚠️ *មិនអាចត្រួតពិនិត្យបាន — Key ត្រូវបានរក្សាទុក។*\n\n"
+            f"⚠️ *មិនអាចត្រួតពិនិត្យបាន — {key_type.title()} Key ត្រូវបានរក្សាទុក।*\n\n"
             "ប្រើ /story ដើម្បីសាកល្បង។",
             parse_mode="Markdown",
         )
         return ConversationHandler.END
 
-# ─── /mykey ───────────────────────────────────────────────────────────────────
-async def mykey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    personal_key = USER_KEYS.get(str(user_id))
+# ─── /history ─────────────────────────────────────────────────────────────────
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid     = update.effective_user.id
+    history = get_history(uid)
 
-    if personal_key:
-        masked = personal_key[:8] + "••••••••" + personal_key[-4:]
+    if not history:
         await update.message.reply_text(
-            f"🔑 *API Key របស់អ្នក:*\n`{masked}`\n\n"
-            "✅ Key ត្រូវបានរក្សាទុក\n\n"
-            "សូមជ្រើសសកម្មភាព:",
-            parse_mode="Markdown",
-            reply_markup=key_manage_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "⚠️ *អ្នកមិនទាន់មាន API Key ទេ!*\n\n"
-            "ប្រើ /setkey ដើម្បីដាក់ Gemini API Key\n"
-            "ទទួល key ឥតគិតថ្លៃ: [aistudio.google.com](https://aistudio.google.com/app/apikey)",
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-    return ConversationHandler.END
-
-async def key_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]
-    user_id = query.from_user.id
-
-    if action == "set":
-        await query.edit_message_text(
-            "🔑 *ដាក់ / ប្តូរ Gemini API Key*\n\n"
-            "សូមវាយ key ថ្មី:\n"
-            "_Key ចាប់ផ្តើមដោយ_ `AIzaSy...`\n\n"
-            "⚠️ Bot នឹងលុប message ភ្លាម ដើម្បីសុវត្ថិភាព\n\n"
-            "/cancel ដើម្បីបោះបង់",
+            "📚 *គ្មានប្រវត្តិរឿង*\n\nប្រើ /story ដើម្បីបង្កើតរឿងដំបូង!",
             parse_mode="Markdown",
         )
-        return WAITING_FOR_KEY
+        return
 
-    elif action == "delete":
-        if delete_user_key(user_id):
-            await query.edit_message_text(
-                "🗑️ *API Key ត្រូវបានលុបរួចហើយ!*\n\n"
-                "ប្រើ /setkey ដើម្បីដាក់ key ថ្មី។",
-                parse_mode="Markdown",
-            )
-        else:
-            await query.edit_message_text("⚠️ គ្មាន Key ដើម្បីលុប។")
-        return ConversationHandler.END
+    lines = ["📚 *ប្រវត្តិរឿង (ចុងក្រោយ)*\n"]
+    for i, h in enumerate(history[:10], 1):
+        lines.append(f"*{i}.* {h['genre']} — {h['topic']}\n   🕒 {h['date']}\n")
 
-    elif action == "back":
-        await query.edit_message_text(
-            "◀️ ប្រើ /story ដើម្បីបន្ត ឬ /help ដើម្បីមើលជំនួយ។"
-        )
-        return ConversationHandler.END
-
-    return ConversationHandler.END
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+    )
 
 # ─── Story flow ───────────────────────────────────────────────────────────────
 async def story_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    if not get_user_key(user_id):
+    uid = update.effective_user.id
+    if not (get_user_groq_key(uid) or get_user_gemini_key(uid)):
         await update.message.reply_text(
             "⚠️ *អ្នកមិនទាន់មាន API Key ទេ!*\n\n"
-            "ប្រើ /setkey ដើម្បីដាក់ Gemini API Key ជាមុន\n"
-            "ទទួល key ឥតគិតថ្លៃ: [aistudio.google.com](https://aistudio.google.com/app/apikey)",
+            "ប្រើ /settings ដើម្បីដាក់ Groq ឬ Gemini API Key\n\n"
+            "⚡ *Groq (FREE & FAST):* [console.groq.com/keys](https://console.groq.com/keys)\n"
+            "🤖 *Gemini (FREE):* [aistudio.google.com](https://aistudio.google.com/app/apikey)",
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
@@ -345,7 +595,7 @@ async def genre_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     genre_key = query.data.split(":")[1]
     genre_label, genre_desc = GENRES[genre_key]
     context.user_data["genre_label"] = genre_label
-    context.user_data["genre_desc"] = genre_desc
+    context.user_data["genre_desc"]  = genre_desc
 
     await query.edit_message_text(
         f"✅ ប្រភេទ: *{genre_label}*\n\n"
@@ -356,59 +606,75 @@ async def genre_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return TYPING_TOPIC
 
 async def topic_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    topic = update.message.text.strip()
-    user_id = update.effective_user.id
+    topic       = update.message.text.strip()
+    uid         = update.effective_user.id
     genre_label = context.user_data.get("genre_label", "")
-    genre_desc  = context.user_data.get("genre_desc", "")
+    genre_desc  = context.user_data.get("genre_desc",  "")
     context.user_data["topic"] = topic
 
-    api_key = get_user_key(user_id)
-    if not api_key:
-        await update.message.reply_text(
-            "⚠️ *API Key ខ្វះ!* សូមប្រើ /setkey ជាមុន។", parse_mode="Markdown"
-        )
-        return ConversationHandler.END
+    provider  = get_user_provider(uid)
+    model     = get_user_model(uid)
+    prov_icon = "⚡" if provider == "groq" else "🤖"
 
     thinking_msg = await update.message.reply_text(
         f"🪄 *AI កំពុងនិទានរឿង...*\n\n"
         f"📖 ប្រភេទ: {genre_label}\n"
-        f"🏷️ ប្រធានបទ: {topic}\n\n_សូមរង់ចាំ..._",
+        f"🏷️ ប្រធានបទ: {topic}\n"
+        f"{prov_icon} {provider.title()} · `{model}`\n\n"
+        "_សូមរង់ចាំ..._",
         parse_mode="Markdown",
     )
-    story = await generate_story(api_key, genre_desc, topic)
+
+    story, used_provider = await generate_story(uid, genre_desc, topic)
     await thinking_msg.delete()
+
+    prov_badge = f"⚡ Groq" if used_provider == "groq" else f"🤖 Gemini" if used_provider == "gemini" else ""
+    fallback_note = f" _(fallback)_" if used_provider != provider else ""
+
+    add_to_history(uid, genre_label, topic, story)
 
     await update.message.reply_text(
         f"📜 *រឿង: {topic}*\n"
-        f"🏷️ {genre_label}\n{'─'*28}\n\n"
-        f"{story}\n\n{'─'*28}\n"
-        f"_✨ បង្កើតដោយ AI Khmer Storyteller_",
+        f"🏷️ {genre_label}  {prov_badge}{fallback_note}\n"
+        f"{'─'*28}\n\n"
+        f"{story}\n\n"
+        f"{'─'*28}\n"
+        f"_✨ បង្កើតដោយ AI Khmer Storyteller v2_",
         parse_mode="Markdown",
         reply_markup=action_keyboard(),
     )
     return READING_STORY
 
 async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
+    query  = update.callback_query
     await query.answer()
     action = query.data.split(":")[1]
-    user_id = query.from_user.id
+    uid    = query.from_user.id
 
     if action == "new":
         genre_label = context.user_data.get("genre_label", "")
         genre_desc  = context.user_data.get("genre_desc", "")
         topic       = context.user_data.get("topic", "")
-        api_key     = get_user_key(user_id)
+        provider    = get_user_provider(uid)
+        prov_icon   = "⚡" if provider == "groq" else "🤖"
+
         thinking_msg = await query.message.reply_text(
-            "🪄 *AI កំពុងបង្កើតរឿងថ្មី...*", parse_mode="Markdown"
+            f"🪄 *AI កំពុងបង្កើតរឿងថ្មី...*\n{prov_icon} {provider.title()}",
+            parse_mode="Markdown",
         )
-        story = await generate_story(api_key, genre_desc, topic)
+        story, used_provider = await generate_story(uid, genre_desc, topic)
         await thinking_msg.delete()
+
+        add_to_history(uid, genre_label, topic, story)
+        prov_badge = f"⚡ Groq" if used_provider == "groq" else f"🤖 Gemini"
+
         await query.message.reply_text(
             f"📜 *រឿងថ្មី: {topic}*\n"
-            f"🏷️ {genre_label}\n{'─'*28}\n\n"
-            f"{story}\n\n{'─'*28}\n"
-            f"_✨ បង្កើតដោយ AI Khmer Storyteller_",
+            f"🏷️ {genre_label}  {prov_badge}\n"
+            f"{'─'*28}\n\n"
+            f"{story}\n\n"
+            f"{'─'*28}\n"
+            f"_✨ បង្កើតដោយ AI Khmer Storyteller v2_",
             parse_mode="Markdown",
             reply_markup=action_keyboard(),
         )
@@ -423,12 +689,27 @@ async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return CHOOSING_GENRE
 
+    elif action == "history":
+        history = get_history(uid)
+        if not history:
+            await query.message.reply_text(
+                "📚 *គ្មានប្រវត្តិ*\nសូមបង្កើតរឿងបន្ថែម!",
+                parse_mode="Markdown",
+            )
+        else:
+            lines = ["📚 *ប្រវត្តិរឿង (ចុងក្រោយ ១០)*\n"]
+            for i, h in enumerate(history[:10], 1):
+                lines.append(f"*{i}.* {h['genre']} — {h['topic']}\n   🕒 {h['date']}\n")
+            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return READING_STORY
+
     elif action == "home":
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
             "🏠 *ទំព័រដើម*\n\n"
             "• /story — បង្កើតរឿង\n"
-            "• /mykey — គ្រប់គ្រង API Key\n"
+            "• /settings — ការកំណត់ / Keys\n"
+            "• /history — ប្រវត្តិរឿង\n"
             "• /help — ជំនួយ",
             parse_mode="Markdown",
         )
@@ -439,20 +720,27 @@ async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ─── /help & /cancel ──────────────────────────────────────────────────────────
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📚 *របៀបប្រើ Bot*\n\n"
+        "📚 *របៀបប្រើ Bot v2*\n\n"
         "*ជំហាន:*\n"
-        "1️⃣ ទទួល Gemini API Key ឥតគិតថ្លៃ:\n"
-        "   [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)\n"
-        "2️⃣ /setkey → វាយ key\n"
+        "1️⃣ ទទួល API Key ឥតគិតថ្លៃ:\n"
+        "   ⚡ *Groq (លឿណាស់):* [console.groq.com/keys](https://console.groq.com/keys)\n"
+        "   🤖 *Gemini:* [aistudio.google.com](https://aistudio.google.com/app/apikey)\n"
+        "2️⃣ /settings → ដាក់ key\n"
         "3️⃣ /story → ជ្រើសប្រភេទ → វាយប្រធានបទ\n"
         "4️⃣ ទទួលរឿង 🎉\n\n"
         "*ពាក្យបញ្ជា:*\n"
         "/start — ចាប់ផ្តើម\n"
         "/story — បង្កើតរឿង\n"
-        "/setkey — ដាក់ / ប្តូរ API Key\n"
-        "/mykey — មើល / លុប API Key\n"
+        "/settings — ការកំណត់ / Keys / Model\n"
+        "/history — ប្រវត្តិរឿង\n"
         "/help — ជំនួយ\n"
-        "/cancel — បោះបង់",
+        "/cancel — បោះបង់\n\n"
+        "*✨ ថ្មីក្នុង v2:*\n"
+        "⚡ Groq AI (លឿនជាង 10x)\n"
+        "🔄 Auto-fallback (ប្ដូរ provider ស្វ័យប្រវត្ត)\n"
+        "🧠 ជ្រើស model ដែលចូលចិត្ត\n"
+        "📚 ប្រវត្តិរឿង (ចំងាយ ២០ រឿង)\n"
+        "😄 Genre ថ្មី: Comedy + Mystery",
         parse_mode="Markdown",
         disable_web_page_preview=True,
     )
@@ -470,15 +758,18 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Key management conversation (handles /setkey + key:set callback)
-    key_conv = ConversationHandler(
+    # Settings conversation (handles key input)
+    settings_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("setkey", setkey_command),
-            CallbackQueryHandler(key_callback_handler, pattern=r"^key:set$"),
+            CommandHandler("settings", settings_command),
+            CallbackQueryHandler(settings_callback, pattern=r"^settings:"),
         ],
         states={
             WAITING_FOR_KEY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_key)
+            ],
+            CHOOSING_MODEL: [
+                CallbackQueryHandler(model_callback, pattern=r"^model:"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -500,14 +791,14 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    app.add_handler(key_conv)
+    app.add_handler(settings_conv)
     app.add_handler(story_conv)
-    app.add_handler(CommandHandler("mykey", mykey_command))
-    app.add_handler(CallbackQueryHandler(key_callback_handler, pattern=r"^key:"))
-    app.add_handler(CommandHandler("help",  help_command))
+    app.add_handler(CallbackQueryHandler(provider_callback, pattern=r"^prov:"))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("help",    help_command))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    logger.info("Khmer Storytelling Bot started!")
+    logger.info("Khmer Storytelling Bot v2 started! (Groq + Gemini)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

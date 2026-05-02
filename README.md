@@ -1,102 +1,148 @@
-# 🎭 AI Khmer Storytelling Telegram Bot
+# 🎭 AI Khmer Storytelling Telegram Bot v2
 
-Bot Telegram ដែលប្រើ AI Gemini សម្រាប់និទានរឿងខ្មែរ!
+Bot Telegram ដែលប្រើ AI **Groq + Gemini** សម្រាប់និទានរឿងខ្មែរ!
 
-## ✨ លក្ខណៈពិសេស
+## ✨ What's New in v2
 
-- 🏮 រឿងនិទាន (Folk Tales)
-- 👻 រឿងខ្មោច (Ghost Stories)
-- 💕 រឿងស្នេហ៍ (Love Stories)
-- ⚔️ រឿងផ្សងព្រេង (Adventures)
-- 🐘 រឿងសត្វ (Fables)
-- 🌟 រឿងព្រេង (Legends)
-- 🏙️ រឿងទំនើប (Modern Stories)
-- 🌈 រឿងកុមារ (Children's Stories)
+| Feature | v1 | v2 |
+|---------|----|----|
+| AI Provider | Gemini only | ⚡ Groq + 🤖 Gemini |
+| Speed | ~3-5s | < 1s (Groq) |
+| Auto-fallback | ❌ | ✅ |
+| Model selection | ❌ | ✅ 7 models |
+| Story genres | 8 | 10 (+Comedy, +Mystery) |
+| Story history | ❌ | ✅ Last 20 stories |
+| Key management | /setkey, /mykey | Unified /settings |
 
-## 🚀 របៀបដំណើរការ
+## 🤖 Supported AI Models
 
-### ជំហានទី ១: ទទួល API Keys
+### ⚡ Groq (Free, Ultra-Fast)
+- `llama-3.3-70b-versatile` — Best quality
+- `llama-3.1-8b-instant` — Fastest (~0.3s)
+- `mixtral-8x7b-32768` — Balanced
+- `gemma2-9b-it` — Google's model via Groq
 
-**Telegram Bot Token:**
-1. បើក Telegram → ស្វែងរក `@BotFather`
-2. វាយ `/newbot` → ដាក់ឈ្មោះ bot
-3. ចម្លង token ដែលបានទទួល
+### 🤖 Gemini (Free)
+- `gemini-1.5-flash` — Fast & good
+- `gemini-1.5-pro` — Best quality
+- `gemini-2.0-flash` — Newest
 
-**Gemini API Key (FREE):**
-1. ចូល [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
-2. ចុច "Create API Key"
-3. ចម្លង key (free tier ៖ 15 requests/min, 1500/day)
+## 📖 Story Genres (10 types)
 
-### ជំហានទី ២: Setup Project
+| Genre | Khmer | English |
+|-------|-------|---------|
+| 🏮 | រឿងនិទាន | Folk Tales |
+| 👻 | រឿងខ្មោច | Ghost Stories |
+| 💕 | រឿងស្នេហ៍ | Love Stories |
+| ⚔️ | រឿងផ្សងព្រេង | Adventures |
+| 🐘 | រឿងសត្វ | Animal Fables |
+| 🌟 | រឿងព្រេង | Legends |
+| 🏙️ | រឿងទំនើប | Modern Stories |
+| 🌈 | រឿងកុមារ | Children's Stories |
+| 😄 | រឿងកំប្លែង | Comedy *(NEW)* |
+| 🔍 | រឿងអាថ៌កំបាំង | Mystery *(NEW)* |
+
+## 🚀 Setup
+
+### Step 1: Get API Keys
+
+**Telegram Bot Token** — [@BotFather](https://t.me/BotFather) → `/newbot`
+
+**Groq API Key (FREE, recommended):**
+1. Go to [console.groq.com/keys](https://console.groq.com/keys)
+2. Sign up free → Create API Key
+3. Starts with `gsk_...`
+
+**Gemini API Key (FREE, optional):**
+1. Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. Create API Key → starts with `AIzaSy...`
+
+> 💡 You can add both! Bot will auto-fallback to the other if one fails.
+
+### Step 2: Install
 
 ```bash
-# Clone / download files
-cd khmer_story_bot
-
-# Create virtual environment
+cd khmer_story_bot_v2
 python -m venv venv
 source venv/bin/activate      # Linux/Mac
 # venv\Scripts\activate       # Windows
 
-# Install dependencies
 pip install -r requirements.txt
-
-# Setup environment variables
 cp .env.example .env
 # Edit .env and fill in your keys
 ```
 
-### ជំហានទី ៣: Configure .env
+### Step 3: Configure .env
 
 ```env
 TELEGRAM_TOKEN=1234567890:ABCdef...
-GEMINI_API_KEY=AIzaSy...
+GROQ_API_KEY=gsk_...
+GEMINI_API_KEY=AIzaSy...    # optional
 ```
 
-### ជំហានទី ៤: Run Bot
+### Step 4: Run
 
 ```bash
 python bot.py
 ```
 
-## 📱 ពាក្យបញ្ជា Bot
+## 📱 Bot Commands
 
-| Command | អត្ថន័យ |
-|---------|---------|
-| `/start` | ចាប់ផ្តើមប្រើ bot |
-| `/story` | បង្កើតរឿងថ្មី |
-| `/help` | មើលជំនួយ |
-| `/cancel` | បោះបង់ |
+| Command | Description |
+|---------|-------------|
+| `/start` | Welcome + setup guide |
+| `/story` | Create a new story |
+| `/settings` | Manage keys, provider, model |
+| `/history` | View last 20 stories |
+| `/help` | Full help guide |
+| `/cancel` | Cancel current action |
 
-## 🌐 Deploy (Optional)
+## 🔄 Auto-Fallback System
 
-**ដំណើរការ 24/7 ដោយឥតគិតថ្លៃ:**
+If your primary provider fails (quota, network, etc.), the bot **automatically** tries the other provider:
 
+```
+Groq fails → tries Gemini  ✅
+Gemini fails → tries Groq  ✅
+```
+
+Story output shows which provider was actually used.
+
+## 🌐 Deploy
+
+### Railway.app
 ```bash
-# Railway.app
-railway init
-railway add
-railway deploy
+railway init && railway up
+# Set env vars in Railway dashboard
+```
 
-# ឬ Render.com
-# ឬ Fly.io
+### Render.com
+1. Connect repo
+2. Add environment variables
+3. Deploy as "Web Service" with `python bot.py`
+
+### Fly.io
+```bash
+fly launch
+fly secrets set TELEGRAM_TOKEN=... GROQ_API_KEY=...
+fly deploy
 ```
 
 ## 📦 Tech Stack
 
 - `python-telegram-bot` v21 — Telegram Bot SDK
-- `google-generativeai` — Gemini 1.5 Flash (free tier)
+- `groq` v0.11 — Groq AI (Llama, Mixtral, Gemma)
+- `google-generativeai` — Gemini models
 - Python 3.10+
 
-## 💡 Gemini Free Tier Limits
+## 💡 Free Tier Limits
 
-| Metric | Limit |
-|--------|-------|
-| Requests/minute | 15 RPM |
-| Requests/day | 1,500 RPD |
-| Tokens/minute | 1M TPM |
+| Provider | RPM | RPD | Notes |
+|----------|-----|-----|-------|
+| Groq | 30 | 14,400 | Ultra-fast |
+| Gemini | 15 | 1,500 | Reliable |
 
-Free tier គ្រប់គ្រាន់សម្រាប់ personal bot!
+Use both keys together for maximum capacity!
 
 ---
-_✨ Made with ❤️ for Khmer culture_
+_✨ Made with ❤️ for Khmer culture — v2 with Groq support_

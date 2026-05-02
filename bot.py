@@ -7,7 +7,7 @@ from pathlib import Path
 import google.generativeai as genai
 from google.api_core.exceptions import PermissionDenied, InvalidArgument
 
-# Load .env when running locally (Railway injects env vars directly)
+# Load .env when running locally (Render injects env vars directly)
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
@@ -38,11 +38,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if not TELEGRAM_TOKEN:
-    logger.critical("TELEGRAM_TOKEN is not set! Add it in Railway -> Variables.")
+    logger.critical("TELEGRAM_TOKEN is not set! Add it in Render Dashboard -> Environment.")
     sys.exit(1)
 
 # ─── Persistent user-key store (JSON file) ───────────────────────────────────
-KEYS_FILE = Path(__file__).parent / "user_keys.json"
+# Render mounts a persistent disk at /data; fall back to local dir for dev
+_DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).parent
+KEYS_FILE = _DATA_DIR / "user_keys.json"
 
 def _load_keys() -> dict:
     if KEYS_FILE.exists():
@@ -130,7 +132,19 @@ def key_manage_keyboard() -> InlineKeyboardMarkup:
     ])
 
 # ─── Gemini ───────────────────────────────────────────────────────────────────
+import asyncio
+import google.generativeai as _genai_mod
+
+def _call_gemini(api_key: str, prompt: str) -> str:
+    """Run in a thread — avoids blocking the async event loop."""
+    import google.generativeai as g
+    g.configure(api_key=api_key)
+    m = g.GenerativeModel("gemini-1.5-flash")
+    return m.generate_content(prompt).text
+
 async def generate_story(api_key: str, genre_desc: str, topic: str) -> str:
+    if not api_key:
+        return "⚠️ *គ្មាន API Key!*\nសូមប្រើ /setkey ដើម្បីដាក់ Gemini API Key ជាមុន។"
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"ប្រភេទរឿង: {genre_desc}\n"
@@ -138,14 +152,16 @@ async def generate_story(api_key: str, genre_desc: str, topic: str) -> str:
         f"សូមសរសេររឿងខ្មែរមួយពីប្រធានបទខាងលើ:"
     )
     try:
-        genai.configure(api_key=api_key)
-        m = genai.GenerativeModel("gemini-1.5-flash")
-        response = m.generate_content(prompt)
-        return response.text
-    except (PermissionDenied, InvalidArgument):
-        return "🔑 *Gemini API Key មិនត្រឹមត្រូវ!*\nសូមប្រើ /setkey ដើម្បីដាក់ key ថ្មី។"
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, _call_gemini, api_key, prompt)
+        return text
     except Exception as e:
+        err = str(e).lower()
         logger.error(f"Gemini error: {e}")
+        if "api_key" in err or "permission" in err or "invalid" in err or "credential" in err:
+            return "🔑 *Gemini API Key មិនត្រឹមត្រូវ!*\nសូមប្រើ /setkey ដើម្បីដាក់ key ថ្មី។"
+        if "quota" in err or "rate" in err or "429" in err:
+            return "⏳ *Gemini free tier ផុត quota!*\nសូមរង់ចាំ ១ នាទី ហើយព្យាយាមម្តងទៀត។"
         return "❌ មានបញ្ហាក្នុងការបង្កើតរឿង។ សូមព្យាយាមម្តងទៀត។"
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -211,9 +227,8 @@ async def receive_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "⏳ *កំពុងត្រួតពិនិត្យ Key...*", parse_mode="Markdown"
     )
     try:
-        genai.configure(api_key=key)
-        m = genai.GenerativeModel("gemini-1.5-flash")
-        m.generate_content("hi")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _call_gemini, key, "hi")
         set_user_key(user_id, key)
         await validating_msg.edit_text(
             "✅ *API Key ត្រឹមត្រូវ! រក្សាទុករួចហើយ។*\n\n"
@@ -222,18 +237,20 @@ async def receive_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         return ConversationHandler.END
 
-    except (PermissionDenied, InvalidArgument):
-        await validating_msg.edit_text(
-            "❌ *Key នេះខុស ឬគ្មានសិទ្ធ!*\n\n"
-            "សូមពិនិត្យ key ម្តងទៀត ឬបង្កើតថ្មី:\n"
-            "[aistudio.google.com](https://aistudio.google.com/app/apikey)\n\n"
-            "ព្យាយាមម្តងទៀត ឬ /cancel ដើម្បីបោះបង់។",
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-        return WAITING_FOR_KEY
     except Exception as e:
-        logger.warning(f"Key validation fallback: {e}")
+        err = str(e).lower()
+        logger.warning(f"Key validation error: {e}")
+        if "api_key" in err or "permission" in err or "invalid" in err or "credential" in err:
+            await validating_msg.edit_text(
+                "❌ *Key នេះខុស ឬគ្មានសិទ្ធ!*\n\n"
+                "សូមពិនិត្យ key ម្តងទៀត ឬបង្កើតថ្មី:\n"
+                "[aistudio.google.com](https://aistudio.google.com/app/apikey)\n\n"
+                "ព្យាយាមម្តងទៀត ឬ /cancel ដើម្បីបោះបង់។",
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            return WAITING_FOR_KEY
+        # Network/unknown error — save anyway and let user test
         set_user_key(user_id, key)
         await validating_msg.edit_text(
             "⚠️ *មិនអាចត្រួតពិនិត្យបាន — Key ត្រូវបានរក្សាទុក។*\n\n"
